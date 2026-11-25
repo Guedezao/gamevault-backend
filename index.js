@@ -1,3 +1,4 @@
+cat << 'EOF' > index.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -57,3 +58,8 @@ app.get('/api/v1/games/:id', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor a correr na porta ${PORT}`);
 });
+EOF
+node -c index.js
+git add index.js
+git commit --allow-empty -m "fix: ensure valid index.js for Railway deploy"
+git push
