@@ -170,7 +170,6 @@ function getWishlistSet(userId) {
   return wishlistsByUser.get(userId);
 }
 
-// Parser simples para multipart/form-data com o campo "file"
 function parseMultipartFile(req) {
   return new Promise((resolve, reject) => {
     const contentType = req.headers['content-type'] || '';
@@ -282,7 +281,7 @@ app.get('/api/v1/auth/me', requireAuth, (req, res) => {
   return res.status(200).json(toPublicUser(req.user));
 });
 
-// --- Biblioteca (/api/v1/me/library) ---
+// --- Biblioteca ---
 app.get('/api/v1/me/library', requireAuth, (req, res) => {
   const lib = getLibraryMap(req.user.id);
   return res.status(200).json(Array.from(lib.values()));
@@ -320,7 +319,7 @@ app.delete('/api/v1/me/library/:gameId', requireAuth, (req, res) => {
   return res.status(204).send();
 });
 
-// --- Wishlist (/api/v1/me/wishlist) ---
+// --- Wishlist ---
 app.get('/api/v1/me/wishlist', requireAuth, (req, res) => {
   const wish = getWishlistSet(req.user.id);
   const items = Array.from(wish.values()).map((gameId) => ({ gameId }));
@@ -344,7 +343,7 @@ app.delete('/api/v1/me/wishlist/:gameId', requireAuth, (req, res) => {
   return res.status(204).send();
 });
 
-// --- Perfil (/api/v1/me/profile, avatar, cover) ---
+// --- Perfil ---
 app.get('/api/v1/me/profile', requireAuth, (req, res) => {
   return res.status(200).json(toPublicUser(req.user));
 });
@@ -414,14 +413,35 @@ const games = [
     slug: 'elden-ring',
     name: 'Elden Ring',
     description: 'Um RPG de acao num vasto mundo de fantasia.',
-    backgroundImage: '',
-    coverImage: '',
-    screenshots: [],
+    backgroundImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/page_bg_generated_v6b.jpg',
+    coverImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/library_600x900.jpg',
+    screenshots: [
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/ss_ae44317e3bd07b7698b4d2a93d91c7d8814a162b.1920x1080.jpg',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/ss_3c41384a24d86dddd58a8f61db77f9dc0bfda8b5.1920x1080.jpg',
+    ],
     genres: ['RPG', 'Acao'],
     platforms: ['PC', 'PlayStation', 'Xbox'],
     released: '2022-02-25',
     rating: null,
     ratingSource: null,
+    systemRequirements: {
+      minimum: {
+        os: null,
+        processor: null,
+        memory: null,
+        graphics: null,
+        storage: null,
+        directX: null,
+      },
+      recommended: {
+        os: null,
+        processor: null,
+        memory: null,
+        graphics: null,
+        storage: null,
+        directX: null,
+      },
+    },
   },
 ];
 
