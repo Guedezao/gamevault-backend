@@ -406,7 +406,7 @@ app.delete('/api/v1/me/cover', requireAuth, (req, res) => {
   return res.status(200).json({ coverUrl: null, user: toPublicUser(req.user) });
 });
 
-// --- Jogos ---
+// --- Jogos e Ofertas ---
 const games = [
   {
     id: 'elden-ring',
@@ -445,6 +445,20 @@ const games = [
   },
 ];
 
+const gameOffers = [
+  {
+    id: 'offer-001',
+    gameId: 'elden-ring',
+    platform: 'PC',
+    edition: 'Standard',
+    activationPlatform: 'Steam',
+    region: 'EU',
+    price: null,
+    currency: 'EUR',
+    available: false,
+  },
+];
+
 app.get('/api/v1/games', (req, res) => {
   res.json(games);
 });
@@ -455,6 +469,15 @@ app.get('/api/v1/games/:id', (req, res) => {
     return res.status(404).json({ message: 'Jogo nao encontrado' });
   }
   return res.json(game);
+});
+
+app.get('/api/v1/games/:id/offers', (req, res) => {
+  const game = games.find((g) => g.id === req.params.id);
+  if (!game) {
+    return res.status(404).json({ message: 'Jogo nao encontrado' });
+  }
+  const offers = gameOffers.filter((o) => o.gameId === game.id);
+  return res.status(200).json(offers);
 });
 
 app.listen(PORT, () => {
