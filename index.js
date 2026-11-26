@@ -3,10 +3,12 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const { Resend } = require('resend');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 const TOKEN_SECRET = process.env.TOKEN_SECRET || 'dev-secret-change-in-prod';
+const RESEND_FROM = process.env.RESEND_FROM || 'GameVault <onboarding@resend.dev>';
 
 if (!process.env.DATABASE_URL) {
   console.error('ERRO: DATABASE_URL em falta nas variaveis de ambiente.');
@@ -19,6 +21,8 @@ const pool = new Pool({
     ? false
     : { rejectUnauthorized: false },
 });
+
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const allowedOrigins = (process.env.CORS_ORIGIN || '')
   .split(',')
@@ -41,6 +45,7 @@ app.use(
 app.use(express.json({ limit: '10mb' }));
 
 const VALID_LIBRARY_STATUSES = ['backlog', 'playing', 'completed', 'dropped'];
+const VALID_PAYMENT_METHODS = ['card_demo', 'multibanco_demo'];
 
 async function initDatabase() {
   await pool.query(`
@@ -97,8 +102,12 @@ async function initDatabase() {
       region TEXT NOT NULL,
       price NUMERIC,
       currency TEXT NOT NULL DEFAULT 'EUR',
-      available BOOLEAN NOT NULL DEFAULT FALSE
+      available BOOLEAN NOT NULL DEFAULT FALSE,
+      stock INTEGER NOT NULL DEFAULT 0 CHECK (stock >= 0)
     );
+
+    ALTER TABLE game_offers
+      ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 0;
 
     CREATE TABLE IF NOT EXISTS game_reviews (
       id TEXT PRIMARY KEY,
@@ -110,9 +119,54 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (game_id, user_id)
     );
+
+    CREATE TABLE IF NOT EXISTS user_cart_items (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      offer_id TEXT NOT NULL REFERENCES game_offers(id) ON DELETE CASCADE,
+      game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity = 1),
+      added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, offer_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      payment_method TEXT NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'EUR',
+      subtotal NUMERIC NOT NULL,
+      total NUMERIC NOT NULL,
+      payment_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      email_status TEXT NOT NULL DEFAULT 'not_sent',
+      email_error TEXT,
+      email_sent_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      paid_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS order_items (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      offer_id TEXT NOT NULL,
+      game_id TEXT NOT NULL,
+      game_name TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      edition TEXT NOT NULL,
+      region TEXT NOT NULL,
+      activation_platform TEXT NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity >= 1),
+      unit_price NUMERIC NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS order_item_keys (
+      id TEXT PRIMARY KEY,
+      order_item_id TEXT NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+      code TEXT UNIQUE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
-  // Seed inicial do Elden Ring e oferta estrutural se ainda nao existirem
   await pool.query(
     `
     INSERT INTO games (
@@ -147,11 +201,14 @@ async function initDatabase() {
 
   await pool.query(
     `
-    INSERT INTO game_offers (id, game_id, platform, edition, activation_platform, region, price, currency, available)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    ON CONFLICT (id) DO NOTHING
+    INSERT INTO game_offers (id, game_id, platform, edition, activation_platform, region, price, currency, available, stock)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    ON CONFLICT (id) DO UPDATE SET
+      price = COALESCE(game_offers.price, EXCLUDED.price),
+      stock = CASE WHEN game_offers.stock = 0 AND game_offers.price IS NULL THEN EXCLUDED.stock ELSE game_offers.stock END,
+      available = CASE WHEN (CASE WHEN game_offers.stock = 0 AND game_offers.price IS NULL THEN EXCLUDED.stock ELSE game_offers.stock END) > 0 THEN TRUE ELSE FALSE END
     `,
-    ['offer-001', 'elden-ring', 'PC', 'Standard', 'Steam', 'EU', null, 'EUR', false]
+    ['offer-001', 'elden-ring', 'PC', 'Standard (Demo)', 'Steam', 'EU', 39.99, 'EUR', true, 5]
   );
 }
 
@@ -242,6 +299,202 @@ function verifyToken(token) {
   }
 }
 
+function generateDemoKey() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(16);
+  let raw = '';
+  for (let i = 0; i < 16; i += 1) {
+    raw += alphabet[bytes[i] % alphabet.length];
+  }
+  return `GV-DEMO-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}`;
+}
+
+function generateMultibancoDemoDetails() {
+  const entityNum = 10000 + crypto.randomInt(90000);
+  const r1 = String(crypto.randomInt(1000)).padStart(3, '0');
+  const r2 = String(crypto.randomInt(1000)).padStart(3, '0');
+  const r3 = String(crypto.randomInt(1000)).padStart(3, '0');
+  return {
+    entity: `DEMO-${entityNum}`,
+    reference: `DEMO-${r1}-${r2}-${r3}`,
+  };
+}
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildOrderEmailHtml({ user, order, items }) {
+  const formattedDate = new Date(order.paidAt || order.createdAt).toLocaleString('pt-PT', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+
+  const rowsHtml = items
+    .map((item) => {
+      const keysHtml = (item.keys || [])
+        .map(
+          (k) =>
+            `<div style="margin-top:6px;padding:8px 12px;background:#0f172a;color:#38bdf8;font-family:monospace;font-size:14px;border-radius:6px;letter-spacing:1px;">${escapeHtml(k.code)}</div>`
+        )
+        .join('');
+
+      return `
+        <tr>
+          <td style="padding:14px 0;border-bottom:1px solid #e2e8f0;">
+            <div style="font-weight:700;font-size:15px;color:#0f172a;">${escapeHtml(item.gameName)}</div>
+            <div style="font-size:13px;color:#475569;margin-top:2px;">
+              Plataforma: <strong>${escapeHtml(item.platform)}</strong> &bull;
+              Edicao: <strong>${escapeHtml(item.edition)}</strong> &bull;
+              Regiao: <strong>${escapeHtml(item.region)}</strong> &bull;
+              Ativacao: <strong>${escapeHtml(item.activationPlatform)}</strong>
+            </div>
+            <div style="font-size:13px;color:#334155;margin-top:4px;">
+              Quantidade: ${item.quantity} &times; ${Number(item.unitPrice).toFixed(2)} ${escapeHtml(order.currency)} (demonstrativo)
+            </div>
+            ${keysHtml}
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  return `
+    <!DOCTYPE html>
+    <html lang="pt">
+    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+    <body style="margin:0;padding:24px 12px;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0f172a;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;">
+        <tr>
+          <td style="background:#0f172a;padding:24px;text-align:left;">
+            <span style="font-size:22px;font-weight:800;letter-spacing:0.5px;color:#ffffff;">GameVault</span>
+            <span style="display:inline-block;margin-left:8px;padding:2px 8px;font-size:11px;font-weight:600;background:#1e293b;color:#94a3b8;border-radius:999px;">PROJETO ACADEMICO</span>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:24px;">
+            <h1 style="margin:0 0 8px;font-size:20px;color:#0f172a;">Ola, ${escapeHtml(user.display_name || user.username)}!</h1>
+            <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#334155;">
+              Obrigado pela tua compra demonstrativa no <strong>GameVault</strong>. A tua encomenda foi confirmada e as chaves ficticias abaixo ja estao disponiveis na tua area "As minhas compras".
+            </p>
+            <div style="padding:12px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;color:#334155;margin-bottom:18px;">
+              <div><strong>Encomenda:</strong> ${escapeHtml(order.id)}</div>
+              <div><strong>Data:</strong> ${escapeHtml(formattedDate)}</div>
+              <div><strong>Total demonstrativo:</strong> ${Number(order.total).toFixed(2)} ${escapeHtml(order.currency)}</div>
+            </div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+              ${rowsHtml}
+            </table>
+            <div style="margin-top:20px;padding:12px 14px;background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;font-size:12px;line-height:1.5;color:#92400e;">
+              <strong>Aviso Academico:</strong> Este email pertence exclusivamente a um projeto academico. Os pagamentos sao simulados e os codigos apresentados sao puramente demonstrativos, nao sendo validos para ativacao real na Steam, PlayStation, Xbox ou outras plataformas.
+            </div>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+}
+
+async function getFullOrderForUser(orderId, userId, client = pool) {
+  const orderRes = await client.query(
+    'SELECT * FROM orders WHERE id = $1 AND user_id = $2',
+    [orderId, userId]
+  );
+  const order = orderRes.rows[0];
+  if (!order) return null;
+
+  const itemsRes = await client.query(
+    `SELECT id, order_id AS "orderId", offer_id AS "offerId", game_id AS "gameId",
+            game_name AS "gameName", platform, edition, region,
+            activation_platform AS "activationPlatform", quantity, unit_price AS "unitPrice"
+     FROM order_items WHERE order_id = $1 ORDER BY id ASC`,
+    [order.id]
+  );
+
+  const itemIds = itemsRes.rows.map((i) => i.id);
+  let keysByItem = new Map();
+  if (itemIds.length > 0 && order.status === 'paid') {
+    const keysRes = await client.query(
+      `SELECT id, order_item_id AS "orderItemId", code, created_at AS "createdAt"
+       FROM order_item_keys WHERE order_item_id = ANY($1::text[]) ORDER BY created_at ASC`,
+      [itemIds]
+    );
+    for (const k of keysRes.rows) {
+      if (!keysByItem.has(k.orderItemId)) keysByItem.set(k.orderItemId, []);
+      keysByItem.get(k.orderItemId).push(k);
+    }
+  }
+
+  const items = itemsRes.rows.map((item) => ({
+    ...item,
+    unitPrice: Number(item.unitPrice),
+    keys: order.status === 'paid' ? keysByItem.get(item.id) || [] : [],
+  }));
+
+  return {
+    id: order.id,
+    userId: order.user_id,
+    status: order.status,
+    paymentMethod: order.payment_method,
+    currency: order.currency,
+    subtotal: Number(order.subtotal),
+    total: Number(order.total),
+    paymentDetails: order.payment_details || {},
+    emailStatus: order.email_status,
+    createdAt: order.created_at,
+    paidAt: order.paid_at,
+    items,
+  };
+}
+
+async function sendOrderEmailIfNeeded(orderId, user) {
+  const fullOrder = await getFullOrderForUser(orderId, user.id);
+  if (!fullOrder || fullOrder.status !== 'paid') return fullOrder;
+  if (fullOrder.emailStatus === 'sent') return fullOrder;
+
+  if (!resend) {
+    await pool.query(
+      `UPDATE orders SET email_status = 'failed', email_error = 'RESEND_API_KEY nao configurada' WHERE id = $1`,
+      [orderId]
+    );
+    return getFullOrderForUser(orderId, user.id);
+  }
+
+  try {
+    const html = buildOrderEmailHtml({ user, order: fullOrder, items: fullOrder.items });
+    const response = await resend.emails.send({
+      from: RESEND_FROM,
+      to: user.email,
+      subject: 'GameVault — A tua encomenda está pronta!',
+      html,
+    });
+
+    if (response && response.error) {
+      await pool.query(
+        `UPDATE orders SET email_status = 'failed', email_error = $1 WHERE id = $2`,
+        [response.error.message || 'Erro no Resend', orderId]
+      );
+    } else {
+      await pool.query(
+        `UPDATE orders SET email_status = 'sent', email_error = NULL, email_sent_at = NOW() WHERE id = $1`,
+        [orderId]
+      );
+    }
+  } catch (err) {
+    await pool.query(
+      `UPDATE orders SET email_status = 'failed', email_error = $1 WHERE id = $2`,
+      [err.message || 'Falha ao contactar Resend', orderId]
+    );
+  }
+
+  return getFullOrderForUser(orderId, user.id);
+}
+
 function toPublicUser(row) {
   return {
     id: row.id,
@@ -289,7 +542,7 @@ async function requireAuth(req, res, next) {
     }
     req.user = rows[0];
     return next();
-  } catch (err) {
+  } catch {
     return res.status(500).json({ message: 'Erro interno na autenticacao' });
   }
 }
@@ -414,9 +667,7 @@ app.put('/api/v1/me/library/:gameId', requireAuth, async (req, res) => {
     );
     return res.status(200).json(rows[0]);
   } catch (err) {
-    if (err.code === '23503') {
-      return res.status(404).json({ message: 'Jogo nao encontrado' });
-    }
+    if (err.code === '23503') return res.status(404).json({ message: 'Jogo nao encontrado' });
     return res.status(500).json({ message: 'Erro ao atualizar biblioteca' });
   }
 });
@@ -528,6 +779,301 @@ app.delete('/api/v1/me/cover', requireAuth, async (req, res) => {
   return res.status(200).json({ coverUrl: null, user: toPublicUser(rows[0]) });
 });
 
+// --- Carrinho Persistente (/api/v1/me/cart) ---
+app.get('/api/v1/me/cart', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT offer_id AS "offerId", game_id AS "gameId", quantity
+     FROM user_cart_items
+     WHERE user_id = $1
+     ORDER BY added_at ASC`,
+    [req.user.id]
+  );
+  return res.status(200).json({ items: rows });
+});
+
+app.put('/api/v1/me/cart/:offerId', requireAuth, async (req, res) => {
+  const { offerId } = req.params;
+  const quantity = req.body && req.body.quantity !== undefined ? Number(req.body.quantity) : 1;
+
+  if (!Number.isInteger(quantity) || quantity !== 1) {
+    return res.status(400).json({ message: 'Quantidade invalida. Nesta versao a quantidade deve ser 1.' });
+  }
+
+  const offerRes = await pool.query('SELECT * FROM game_offers WHERE id = $1', [offerId]);
+  const offer = offerRes.rows[0];
+  if (!offer) {
+    return res.status(404).json({ message: 'Oferta nao encontrada' });
+  }
+  if (!offer.available || Number(offer.stock) < quantity || offer.price === null) {
+    return res.status(409).json({ message: 'Oferta sem stock ou indisponivel para compra' });
+  }
+
+  await pool.query(
+    `INSERT INTO user_cart_items (user_id, offer_id, game_id, quantity)
+     VALUES ($1, $2, $3, 1)
+     ON CONFLICT (user_id, offer_id)
+     DO UPDATE SET quantity = 1`,
+    [req.user.id, offer.id, offer.game_id]
+  );
+
+  const { rows } = await pool.query(
+    `SELECT offer_id AS "offerId", game_id AS "gameId", quantity
+     FROM user_cart_items
+     WHERE user_id = $1
+     ORDER BY added_at ASC`,
+    [req.user.id]
+  );
+  return res.status(200).json({ items: rows });
+});
+
+app.delete('/api/v1/me/cart/:offerId', requireAuth, async (req, res) => {
+  const { rowCount } = await pool.query(
+    'DELETE FROM user_cart_items WHERE user_id = $1 AND offer_id = $2',
+    [req.user.id, req.params.offerId]
+  );
+  if (!rowCount) {
+    return res.status(404).json({ message: 'Artigo nao encontrado no carrinho' });
+  }
+  const { rows } = await pool.query(
+    `SELECT offer_id AS "offerId", game_id AS "gameId", quantity
+     FROM user_cart_items
+     WHERE user_id = $1
+     ORDER BY added_at ASC`,
+    [req.user.id]
+  );
+  return res.status(200).json({ items: rows });
+});
+
+app.delete('/api/v1/me/cart', requireAuth, async (req, res) => {
+  await pool.query('DELETE FROM user_cart_items WHERE user_id = $1', [req.user.id]);
+  return res.status(200).json({ items: [] });
+});
+
+// --- Encomendas & Checkout Simulado ---
+app.post('/api/v1/orders/checkout', requireAuth, async (req, res) => {
+  const paymentMethod = req.body && req.body.paymentMethod;
+  if (!VALID_PAYMENT_METHODS.includes(paymentMethod)) {
+    return res.status(400).json({
+      message: `Metodo de pagamento invalido. Valores permitidos: ${VALID_PAYMENT_METHODS.join(', ')}`,
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const cartRes = await client.query(
+      `SELECT c.offer_id, c.quantity,
+              o.game_id, o.platform, o.edition, o.activation_platform, o.region,
+              o.price, o.currency, o.available, o.stock,
+              g.name AS game_name
+       FROM user_cart_items c
+       JOIN game_offers o ON o.id = c.offer_id
+       JOIN games g ON g.id = o.game_id
+       WHERE c.user_id = $1
+       ORDER BY c.added_at ASC`,
+      [req.user.id]
+    );
+
+    if (cartRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'O carrinho esta vazio' });
+    }
+
+    let subtotal = 0;
+    const currency = cartRes.rows[0].currency || 'EUR';
+
+    for (const row of cartRes.rows) {
+      if (!row.available || Number(row.stock) < Number(row.quantity) || row.price === null) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          message: `Stock insuficiente para ${row.game_name} (${row.edition})`,
+        });
+      }
+      subtotal += Number(row.price) * Number(row.quantity);
+    }
+
+    subtotal = Number(subtotal.toFixed(2));
+    const total = subtotal;
+    const orderId = `ord_${crypto.randomUUID().slice(0, 8)}`;
+    const paymentDetails =
+      paymentMethod === 'multibanco_demo'
+        ? generateMultibancoDemoDetails()
+        : { label: 'Cartao Bancario Demonstrativo' };
+
+    await client.query(
+      `INSERT INTO orders (id, user_id, status, payment_method, currency, subtotal, total, payment_details)
+       VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7::jsonb)`,
+      [orderId, req.user.id, paymentMethod, currency, subtotal, total, JSON.stringify(paymentDetails)]
+    );
+
+    for (const row of cartRes.rows) {
+      const itemId = `item_${crypto.randomUUID().slice(0, 8)}`;
+      await client.query(
+        `INSERT INTO order_items (
+          id, order_id, offer_id, game_id, game_name, platform, edition, region, activation_platform, quantity, unit_price
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          itemId,
+          orderId,
+          row.offer_id,
+          row.game_id,
+          row.game_name,
+          row.platform,
+          row.edition,
+          row.region,
+          row.activation_platform,
+          Number(row.quantity),
+          Number(row.price),
+        ]
+      );
+    }
+
+    await client.query('DELETE FROM user_cart_items WHERE user_id = $1', [req.user.id]);
+    await client.query('COMMIT');
+
+    const responseBody = {
+      orderId,
+      status: 'pending',
+      paymentMethod,
+      total,
+      currency,
+    };
+    if (paymentMethod === 'multibanco_demo') {
+      responseBody.paymentDetails = paymentDetails;
+    }
+
+    return res.status(201).json(responseBody);
+  } catch {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ message: 'Erro ao criar encomenda de checkout' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/v1/me/orders/:orderId/simulate-payment', requireAuth, async (req, res) => {
+  const { orderId } = req.params;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const orderRes = await client.query(
+      'SELECT * FROM orders WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [orderId, req.user.id]
+    );
+    const order = orderRes.rows[0];
+    if (!order) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Encomenda nao encontrada' });
+    }
+
+    if (order.status === 'paid') {
+      await client.query('COMMIT');
+      const finalOrder = await sendOrderEmailIfNeeded(orderId, req.user);
+      return res.status(200).json(finalOrder);
+    }
+
+    if (order.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: `Nao e possivel confirmar encomenda no estado ${order.status}` });
+    }
+
+    const itemsRes = await client.query(
+      'SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC',
+      [order.id]
+    );
+
+    for (const item of itemsRes.rows) {
+      const offerRes = await client.query(
+        'SELECT * FROM game_offers WHERE id = $1 FOR UPDATE',
+        [item.offer_id]
+      );
+      const offer = offerRes.rows[0];
+      if (!offer || !offer.available || Number(offer.stock) < Number(item.quantity)) {
+        await client.query(
+          `UPDATE orders SET status = 'failed' WHERE id = $1`,
+          [order.id]
+        );
+        await client.query('COMMIT');
+        return res.status(409).json({
+          message: `Stock esgotado durante a confirmacao para ${item.game_name}`,
+        });
+      }
+    }
+
+    for (const item of itemsRes.rows) {
+      const updateStockRes = await client.query(
+        `UPDATE game_offers
+         SET stock = stock - $1,
+             available = CASE WHEN (stock - $1) > 0 THEN TRUE ELSE FALSE END
+         WHERE id = $2 AND stock >= $1
+         RETURNING stock`,
+        [Number(item.quantity), item.offer_id]
+      );
+
+      if (updateStockRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ message: 'Conflito de stock detetado' });
+      }
+
+      for (let i = 0; i < Number(item.quantity); i += 1) {
+        const keyId = `key_${crypto.randomUUID().slice(0, 8)}`;
+        const code = generateDemoKey();
+        await client.query(
+          'INSERT INTO order_item_keys (id, order_item_id, code) VALUES ($1, $2, $3)',
+          [keyId, item.id, code]
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE orders SET status = 'paid', paid_at = NOW() WHERE id = $1`,
+      [order.id]
+    );
+
+    await client.query('COMMIT');
+
+    const finalOrder = await sendOrderEmailIfNeeded(order.id, req.user);
+    return res.status(200).json(finalOrder);
+  } catch {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ message: 'Erro ao confirmar pagamento simulado' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/v1/me/orders/:orderId/resend-email', requireAuth, async (req, res) => {
+  const existing = await getFullOrderForUser(req.params.orderId, req.user.id);
+  if (!existing) return res.status(404).json({ message: 'Encomenda nao encontrada' });
+  if (existing.status !== 'paid') {
+    return res.status(400).json({ message: 'Apenas encomendas pagas podem enviar chaves por email' });
+  }
+  const updated = await sendOrderEmailIfNeeded(existing.id, req.user);
+  return res.status(200).json(updated);
+});
+
+app.get('/api/v1/me/orders', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
+    [req.user.id]
+  );
+  const orders = [];
+  for (const row of rows) {
+    const full = await getFullOrderForUser(row.id, req.user.id);
+    if (full) orders.push(full);
+  }
+  return res.status(200).json(orders);
+});
+
+app.get('/api/v1/me/orders/:orderId', requireAuth, async (req, res) => {
+  const order = await getFullOrderForUser(req.params.orderId, req.user.id);
+  if (!order) return res.status(404).json({ message: 'Encomenda nao encontrada' });
+  return res.status(200).json(order);
+});
+
 // --- Jogos, Ofertas e Reviews ---
 app.get('/api/v1/games', async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM games ORDER BY name ASC');
@@ -546,11 +1092,15 @@ app.get('/api/v1/games/:id/offers', async (req, res) => {
 
   const { rows } = await pool.query(
     `SELECT id, game_id AS "gameId", platform, edition, activation_platform AS "activationPlatform",
-            region, price, currency, available
-     FROM game_offers WHERE game_id = $1`,
+            region, price, currency, available, stock
+     FROM game_offers WHERE game_id = $1 ORDER BY id ASC`,
     [req.params.id]
   );
-  const formatted = rows.map((r) => ({ ...r, price: r.price !== null ? Number(r.price) : null }));
+  const formatted = rows.map((r) => ({
+    ...r,
+    price: r.price !== null ? Number(r.price) : null,
+    stock: Number(r.stock),
+  }));
   return res.status(200).json(formatted);
 });
 
