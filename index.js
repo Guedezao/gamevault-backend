@@ -2,10 +2,23 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 const TOKEN_SECRET = process.env.TOKEN_SECRET || 'dev-secret-change-in-prod';
+
+if (!process.env.DATABASE_URL) {
+  console.error('ERRO: DATABASE_URL em falta nas variaveis de ambiente.');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes('railway.internal')
+    ? false
+    : { rejectUnauthorized: false },
+});
 
 const allowedOrigins = (process.env.CORS_ORIGIN || '')
   .split(',')
@@ -25,15 +38,122 @@ app.use(
   })
 );
 
-app.use(express.json());
-
-// Armazenamento temporario em memoria (sera substituido pelo PostgreSQL)
-const users = [];
-const librariesByUser = new Map();
-const wishlistsByUser = new Map();
-let userCounter = 1;
+app.use(express.json({ limit: '10mb' }));
 
 const VALID_LIBRARY_STATUSES = ['backlog', 'playing', 'completed', 'dropped'];
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      username TEXT UNIQUE NOT NULL,
+      display_name TEXT NOT NULL,
+      bio TEXT NOT NULL DEFAULT '',
+      avatar_url TEXT,
+      cover_url TEXT,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS games (
+      id TEXT PRIMARY KEY,
+      slug TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      background_image TEXT NOT NULL DEFAULT '',
+      cover_image TEXT NOT NULL DEFAULT '',
+      screenshots JSONB NOT NULL DEFAULT '[]'::jsonb,
+      genres JSONB NOT NULL DEFAULT '[]'::jsonb,
+      platforms JSONB NOT NULL DEFAULT '[]'::jsonb,
+      released TEXT,
+      rating NUMERIC,
+      rating_source TEXT,
+      system_requirements JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+
+    CREATE TABLE IF NOT EXISTS user_library (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+      status TEXT NOT NULL,
+      added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, game_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_wishlist (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+      added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, game_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS game_offers (
+      id TEXT PRIMARY KEY,
+      game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+      platform TEXT NOT NULL,
+      edition TEXT NOT NULL,
+      activation_platform TEXT NOT NULL,
+      region TEXT NOT NULL,
+      price NUMERIC,
+      currency TEXT NOT NULL DEFAULT 'EUR',
+      available BOOLEAN NOT NULL DEFAULT FALSE
+    );
+
+    CREATE TABLE IF NOT EXISTS game_reviews (
+      id TEXT PRIMARY KEY,
+      game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+      comment TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (game_id, user_id)
+    );
+  `);
+
+  // Seed inicial do Elden Ring e oferta estrutural se ainda nao existirem
+  await pool.query(
+    `
+    INSERT INTO games (
+      id, slug, name, description, background_image, cover_image,
+      screenshots, genres, platforms, released, rating, rating_source, system_requirements
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13::jsonb)
+    ON CONFLICT (id) DO NOTHING
+    `,
+    [
+      'elden-ring',
+      'elden-ring',
+      'Elden Ring',
+      'Um RPG de acao num vasto mundo de fantasia.',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/page_bg_generated_v6b.jpg',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/library_600x900.jpg',
+      JSON.stringify([
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/ss_ae44317e3bd07b7698b4d2a93d91c7d8814a162b.1920x1080.jpg',
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/ss_3c41384a24d86dddd58a8f61db77f9dc0bfda8b5.1920x1080.jpg',
+      ]),
+      JSON.stringify(['RPG', 'Acao']),
+      JSON.stringify(['PC', 'PlayStation', 'Xbox']),
+      '2022-02-25',
+      null,
+      null,
+      JSON.stringify({
+        minimum: { os: null, processor: null, memory: null, graphics: null, storage: null, directX: null },
+        recommended: { os: null, processor: null, memory: null, graphics: null, storage: null, directX: null },
+      }),
+    ]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO game_offers (id, game_id, platform, edition, activation_platform, region, price, currency, available)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    ON CONFLICT (id) DO NOTHING
+    `,
+    ['offer-001', 'elden-ring', 'PC', 'Standard', 'Steam', 'EU', null, 'EUR', false]
+  );
+}
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -79,11 +199,7 @@ function base64UrlDecode(input) {
 function signToken(payload, ttl) {
   const header = { alg: 'HS256', typ: 'JWT' };
   const nowSec = Math.floor(Date.now() / 1000);
-  const body = {
-    ...payload,
-    iat: nowSec,
-    exp: nowSec + parseTtlSeconds(ttl),
-  };
+  const body = { ...payload, iat: nowSec, exp: nowSec + parseTtlSeconds(ttl) };
   const encodedHeader = base64UrlEncode(JSON.stringify(header));
   const encodedPayload = base64UrlEncode(JSON.stringify(body));
   const data = `${encodedHeader}.${encodedPayload}`;
@@ -126,7 +242,37 @@ function verifyToken(token) {
   }
 }
 
-function requireAuth(req, res, next) {
+function toPublicUser(row) {
+  return {
+    id: row.id,
+    email: row.email,
+    username: row.username,
+    displayName: row.display_name,
+    bio: row.bio || '',
+    avatarUrl: row.avatar_url || null,
+    coverUrl: row.cover_url || null,
+  };
+}
+
+function toPublicGame(row) {
+  return {
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    description: row.description,
+    backgroundImage: row.background_image,
+    coverImage: row.cover_image,
+    screenshots: row.screenshots || [],
+    genres: row.genres || [],
+    platforms: row.platforms || [],
+    released: row.released,
+    rating: row.rating !== null ? Number(row.rating) : null,
+    ratingSource: row.rating_source,
+    systemRequirements: row.system_requirements || {},
+  };
+}
+
+async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || '';
   const [scheme, token] = authHeader.split(' ');
   if (scheme !== 'Bearer' || !token) {
@@ -136,47 +282,23 @@ function requireAuth(req, res, next) {
   if (!payload || !payload.sub) {
     return res.status(401).json({ message: 'Token invalido ou expirado' });
   }
-  const user = users.find((u) => u.id === payload.sub);
-  if (!user) {
-    return res.status(401).json({ message: 'Utilizador nao encontrado' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [payload.sub]);
+    if (!rows[0]) {
+      return res.status(401).json({ message: 'Utilizador nao encontrado' });
+    }
+    req.user = rows[0];
+    return next();
+  } catch (err) {
+    return res.status(500).json({ message: 'Erro interno na autenticacao' });
   }
-  req.user = user;
-  return next();
-}
-
-function toPublicUser(user) {
-  return {
-    id: user.id,
-    email: user.email,
-    username: user.username,
-    displayName: user.displayName,
-    bio: user.bio || '',
-    avatarUrl: user.avatarUrl || null,
-    coverUrl: user.coverUrl || null,
-  };
-}
-
-function getLibraryMap(userId) {
-  if (!librariesByUser.has(userId)) {
-    librariesByUser.set(userId, new Map());
-  }
-  return librariesByUser.get(userId);
-}
-
-function getWishlistSet(userId) {
-  if (!wishlistsByUser.has(userId)) {
-    wishlistsByUser.set(userId, new Set());
-  }
-  return wishlistsByUser.get(userId);
 }
 
 function parseMultipartFile(req) {
   return new Promise((resolve, reject) => {
     const contentType = req.headers['content-type'] || '';
     const match = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
-    if (!match) {
-      return reject(new Error('Content-Type multipart/form-data em falta'));
-    }
+    if (!match) return reject(new Error('Content-Type multipart/form-data em falta'));
     const boundary = match[1] || match[2];
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
@@ -188,34 +310,20 @@ function parseMultipartFile(req) {
         pos += boundaryBuf.length;
         if (raw.slice(pos, pos + 2).toString('utf8') === '--') break;
         if (raw.slice(pos, pos + 2).toString('utf8') === '\r\n') pos += 2;
-
         const headerEnd = raw.indexOf(Buffer.from('\r\n\r\n'), pos);
         if (headerEnd === -1) break;
-
         const headersText = raw.slice(pos, headerEnd).toString('utf8');
         const dataStart = headerEnd + 4;
         const nextBoundary = raw.indexOf(boundaryBuf, dataStart);
         if (nextBoundary === -1) break;
-
         let dataEnd = nextBoundary;
-        if (raw.slice(dataEnd - 2, dataEnd).toString('utf8') === '\r\n') {
-          dataEnd -= 2;
-        }
-
+        if (raw.slice(dataEnd - 2, dataEnd).toString('utf8') === '\r\n') dataEnd -= 2;
         const nameMatch = headersText.match(/name="([^"]+)"/i);
-        const filenameMatch = headersText.match(/filename="([^"]*)"/i);
         const typeMatch = headersText.match(/Content-Type:\s*([^\r\n]+)/i);
-
         if (nameMatch && nameMatch[1] === 'file') {
           const fileBuf = raw.slice(dataStart, dataEnd);
           const mime = (typeMatch && typeMatch[1].trim()) || 'application/octet-stream';
-          const filename = (filenameMatch && filenameMatch[1]) || 'upload';
-          return resolve({
-            filename,
-            mime,
-            size: fileBuf.length,
-            dataUrl: `data:${mime};base64,${fileBuf.toString('base64')}`,
-          });
+          return resolve({ dataUrl: `data:${mime};base64,${fileBuf.toString('base64')}` });
         }
         pos = nextBoundary;
       }
@@ -226,55 +334,52 @@ function parseMultipartFile(req) {
 }
 
 // --- Autenticacao ---
-app.post('/api/v1/auth/register', (req, res) => {
+app.post('/api/v1/auth/register', async (req, res) => {
   const { username, email, password } = req.body || {};
   if (!username || !email || !password) {
     return res.status(400).json({ message: 'Username, email e password sao obrigatorios' });
   }
-
   const normalizedEmail = String(email).trim().toLowerCase();
   const normalizedUsername = String(username).trim();
+  const id = `u_${crypto.randomUUID().slice(0, 8)}`;
 
-  if (users.some((u) => u.email === normalizedEmail)) {
-    return res.status(409).json({ message: 'Email ja registado' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO users (id, email, username, display_name, password_hash)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [id, normalizedEmail, normalizedUsername, normalizedUsername, hashPassword(String(password))]
+    );
+    return res.status(201).json(toPublicUser(rows[0]));
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ message: 'Email ou username ja registado' });
+    }
+    return res.status(500).json({ message: 'Erro ao registar utilizador' });
   }
-  if (users.some((u) => u.username.toLowerCase() === normalizedUsername.toLowerCase())) {
-    return res.status(409).json({ message: 'Username ja em utilizacao' });
-  }
-
-  const newUser = {
-    id: `u${userCounter++}`,
-    email: normalizedEmail,
-    username: normalizedUsername,
-    displayName: normalizedUsername,
-    bio: '',
-    avatarUrl: null,
-    coverUrl: null,
-    passwordHash: hashPassword(String(password)),
-  };
-
-  users.push(newUser);
-  return res.status(201).json(toPublicUser(newUser));
 });
 
-app.post('/api/v1/auth/login', (req, res) => {
+app.post('/api/v1/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ message: 'Email e password sao obrigatorios' });
   }
-
   const normalizedEmail = String(email).trim().toLowerCase();
-  const user = users.find((u) => u.email === normalizedEmail);
-  if (!user || !verifyPassword(String(password), user.passwordHash)) {
-    return res.status(401).json({ message: 'Credenciais invalidas' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [normalizedEmail]);
+    const user = rows[0];
+    if (!user || !verifyPassword(String(password), user.password_hash)) {
+      return res.status(401).json({ message: 'Credenciais invalidas' });
+    }
+    const accessToken = signToken({ sub: user.id, email: user.email }, process.env.TOKEN_TTL);
+    return res.status(200).json({
+      accessToken,
+      tokenType: 'Bearer',
+      user: toPublicUser(user),
+    });
+  } catch {
+    return res.status(500).json({ message: 'Erro ao iniciar sessao' });
   }
-
-  const accessToken = signToken({ sub: user.id, email: user.email }, process.env.TOKEN_TTL);
-  return res.status(200).json({
-    accessToken,
-    tokenType: 'Bearer',
-    user: toPublicUser(user),
-  });
 });
 
 app.get('/api/v1/auth/me', requireAuth, (req, res) => {
@@ -282,12 +387,15 @@ app.get('/api/v1/auth/me', requireAuth, (req, res) => {
 });
 
 // --- Biblioteca ---
-app.get('/api/v1/me/library', requireAuth, (req, res) => {
-  const lib = getLibraryMap(req.user.id);
-  return res.status(200).json(Array.from(lib.values()));
+app.get('/api/v1/me/library', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT game_id AS "gameId", status, added_at AS "addedAt", updated_at AS "updatedAt" FROM user_library WHERE user_id = $1 ORDER BY updated_at DESC',
+    [req.user.id]
+  );
+  return res.status(200).json(rows);
 });
 
-app.put('/api/v1/me/library/:gameId', requireAuth, (req, res) => {
+app.put('/api/v1/me/library/:gameId', requireAuth, async (req, res) => {
   const { gameId } = req.params;
   const status = (req.body && req.body.status) || 'backlog';
   if (!VALID_LIBRARY_STATUSES.includes(status)) {
@@ -295,51 +403,61 @@ app.put('/api/v1/me/library/:gameId', requireAuth, (req, res) => {
       message: `Estado invalido. Valores permitidos: ${VALID_LIBRARY_STATUSES.join(', ')}`,
     });
   }
-
-  const lib = getLibraryMap(req.user.id);
-  const existing = lib.get(gameId);
-  const now = new Date().toISOString();
-  const entry = {
-    gameId,
-    status,
-    updatedAt: now,
-    addedAt: existing ? existing.addedAt : now,
-  };
-  lib.set(gameId, entry);
-  return res.status(200).json(entry);
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO user_library (user_id, game_id, status)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, game_id)
+       DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+       RETURNING game_id AS "gameId", status, added_at AS "addedAt", updated_at AS "updatedAt"`,
+      [req.user.id, gameId, status]
+    );
+    return res.status(200).json(rows[0]);
+  } catch (err) {
+    if (err.code === '23503') {
+      return res.status(404).json({ message: 'Jogo nao encontrado' });
+    }
+    return res.status(500).json({ message: 'Erro ao atualizar biblioteca' });
+  }
 });
 
-app.delete('/api/v1/me/library/:gameId', requireAuth, (req, res) => {
-  const { gameId } = req.params;
-  const lib = getLibraryMap(req.user.id);
-  if (!lib.has(gameId)) {
-    return res.status(404).json({ message: 'Jogo nao encontrado na biblioteca' });
-  }
-  lib.delete(gameId);
+app.delete('/api/v1/me/library/:gameId', requireAuth, async (req, res) => {
+  const { rowCount } = await pool.query(
+    'DELETE FROM user_library WHERE user_id = $1 AND game_id = $2',
+    [req.user.id, req.params.gameId]
+  );
+  if (!rowCount) return res.status(404).json({ message: 'Jogo nao encontrado na biblioteca' });
   return res.status(204).send();
 });
 
 // --- Wishlist ---
-app.get('/api/v1/me/wishlist', requireAuth, (req, res) => {
-  const wish = getWishlistSet(req.user.id);
-  const items = Array.from(wish.values()).map((gameId) => ({ gameId }));
-  return res.status(200).json(items);
+app.get('/api/v1/me/wishlist', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT game_id AS "gameId" FROM user_wishlist WHERE user_id = $1 ORDER BY added_at DESC',
+    [req.user.id]
+  );
+  return res.status(200).json(rows);
 });
 
-app.put('/api/v1/me/wishlist/:gameId', requireAuth, (req, res) => {
-  const { gameId } = req.params;
-  const wish = getWishlistSet(req.user.id);
-  wish.add(gameId);
-  return res.status(200).json({ gameId, wishlisted: true });
-});
-
-app.delete('/api/v1/me/wishlist/:gameId', requireAuth, (req, res) => {
-  const { gameId } = req.params;
-  const wish = getWishlistSet(req.user.id);
-  if (!wish.has(gameId)) {
-    return res.status(404).json({ message: 'Jogo nao encontrado na wishlist' });
+app.put('/api/v1/me/wishlist/:gameId', requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      'INSERT INTO user_wishlist (user_id, game_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.user.id, req.params.gameId]
+    );
+    return res.status(200).json({ gameId: req.params.gameId, wishlisted: true });
+  } catch (err) {
+    if (err.code === '23503') return res.status(404).json({ message: 'Jogo nao encontrado' });
+    return res.status(500).json({ message: 'Erro ao adicionar a wishlist' });
   }
-  wish.delete(gameId);
+});
+
+app.delete('/api/v1/me/wishlist/:gameId', requireAuth, async (req, res) => {
+  const { rowCount } = await pool.query(
+    'DELETE FROM user_wishlist WHERE user_id = $1 AND game_id = $2',
+    [req.user.id, req.params.gameId]
+  );
+  if (!rowCount) return res.status(404).json({ message: 'Jogo nao encontrado na wishlist' });
   return res.status(204).send();
 });
 
@@ -348,138 +466,148 @@ app.get('/api/v1/me/profile', requireAuth, (req, res) => {
   return res.status(200).json(toPublicUser(req.user));
 });
 
-app.patch('/api/v1/me/profile', requireAuth, (req, res) => {
+app.patch('/api/v1/me/profile', requireAuth, async (req, res) => {
   const { displayName, username, bio } = req.body || {};
+  const nextUsername = username !== undefined ? String(username).trim() : req.user.username;
+  const nextDisplayName = displayName !== undefined ? String(displayName).trim() : req.user.display_name;
+  const nextBio = bio !== undefined ? String(bio) : req.user.bio;
 
-  if (username !== undefined) {
-    const cleanUsername = String(username).trim();
-    if (!cleanUsername) {
-      return res.status(400).json({ message: 'Username nao pode estar vazio' });
-    }
-    const taken = users.some(
-      (u) => u.id !== req.user.id && u.username.toLowerCase() === cleanUsername.toLowerCase()
+  if (!nextUsername) return res.status(400).json({ message: 'Username nao pode estar vazio' });
+
+  try {
+    const { rows } = await pool.query(
+      'UPDATE users SET username = $1, display_name = $2, bio = $3 WHERE id = $4 RETURNING *',
+      [nextUsername, nextDisplayName, nextBio, req.user.id]
     );
-    if (taken) {
-      return res.status(409).json({ message: 'Username ja em utilizacao' });
-    }
-    req.user.username = cleanUsername;
+    return res.status(200).json(toPublicUser(rows[0]));
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ message: 'Username ja em utilizacao' });
+    return res.status(500).json({ message: 'Erro ao atualizar perfil' });
   }
-
-  if (displayName !== undefined) {
-    req.user.displayName = String(displayName).trim();
-  }
-
-  if (bio !== undefined) {
-    req.user.bio = String(bio);
-  }
-
-  return res.status(200).json(toPublicUser(req.user));
 });
 
 app.post('/api/v1/me/avatar', requireAuth, async (req, res) => {
   try {
     const file = await parseMultipartFile(req);
-    req.user.avatarUrl = file.dataUrl;
-    return res.status(200).json({ avatarUrl: req.user.avatarUrl, user: toPublicUser(req.user) });
+    const { rows } = await pool.query(
+      'UPDATE users SET avatar_url = $1 WHERE id = $2 RETURNING *',
+      [file.dataUrl, req.user.id]
+    );
+    return res.status(200).json({ avatarUrl: rows[0].avatar_url, user: toPublicUser(rows[0]) });
   } catch (err) {
     return res.status(400).json({ message: err.message || 'Falha no upload do avatar' });
   }
 });
 
-app.delete('/api/v1/me/avatar', requireAuth, (req, res) => {
-  req.user.avatarUrl = null;
-  return res.status(200).json({ avatarUrl: null, user: toPublicUser(req.user) });
+app.delete('/api/v1/me/avatar', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'UPDATE users SET avatar_url = NULL WHERE id = $1 RETURNING *',
+    [req.user.id]
+  );
+  return res.status(200).json({ avatarUrl: null, user: toPublicUser(rows[0]) });
 });
 
 app.post('/api/v1/me/cover', requireAuth, async (req, res) => {
   try {
     const file = await parseMultipartFile(req);
-    req.user.coverUrl = file.dataUrl;
-    return res.status(200).json({ coverUrl: req.user.coverUrl, user: toPublicUser(req.user) });
+    const { rows } = await pool.query(
+      'UPDATE users SET cover_url = $1 WHERE id = $2 RETURNING *',
+      [file.dataUrl, req.user.id]
+    );
+    return res.status(200).json({ coverUrl: rows[0].cover_url, user: toPublicUser(rows[0]) });
   } catch (err) {
     return res.status(400).json({ message: err.message || 'Falha no upload da capa' });
   }
 });
 
-app.delete('/api/v1/me/cover', requireAuth, (req, res) => {
-  req.user.coverUrl = null;
-  return res.status(200).json({ coverUrl: null, user: toPublicUser(req.user) });
+app.delete('/api/v1/me/cover', requireAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    'UPDATE users SET cover_url = NULL WHERE id = $1 RETURNING *',
+    [req.user.id]
+  );
+  return res.status(200).json({ coverUrl: null, user: toPublicUser(rows[0]) });
 });
 
-// --- Jogos e Ofertas ---
-const games = [
-  {
-    id: 'elden-ring',
-    slug: 'elden-ring',
-    name: 'Elden Ring',
-    description: 'Um RPG de acao num vasto mundo de fantasia.',
-    backgroundImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/page_bg_generated_v6b.jpg',
-    coverImage: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/library_600x900.jpg',
-    screenshots: [
-      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/ss_ae44317e3bd07b7698b4d2a93d91c7d8814a162b.1920x1080.jpg',
-      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1245620/ss_3c41384a24d86dddd58a8f61db77f9dc0bfda8b5.1920x1080.jpg',
-    ],
-    genres: ['RPG', 'Acao'],
-    platforms: ['PC', 'PlayStation', 'Xbox'],
-    released: '2022-02-25',
-    rating: null,
-    ratingSource: null,
-    systemRequirements: {
-      minimum: {
-        os: null,
-        processor: null,
-        memory: null,
-        graphics: null,
-        storage: null,
-        directX: null,
-      },
-      recommended: {
-        os: null,
-        processor: null,
-        memory: null,
-        graphics: null,
-        storage: null,
-        directX: null,
-      },
-    },
-  },
-];
-
-const gameOffers = [
-  {
-    id: 'offer-001',
-    gameId: 'elden-ring',
-    platform: 'PC',
-    edition: 'Standard',
-    activationPlatform: 'Steam',
-    region: 'EU',
-    price: null,
-    currency: 'EUR',
-    available: false,
-  },
-];
-
-app.get('/api/v1/games', (req, res) => {
-  res.json(games);
+// --- Jogos, Ofertas e Reviews ---
+app.get('/api/v1/games', async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM games ORDER BY name ASC');
+  return res.status(200).json(rows.map(toPublicGame));
 });
 
-app.get('/api/v1/games/:id', (req, res) => {
-  const game = games.find((g) => g.id === req.params.id);
-  if (!game) {
-    return res.status(404).json({ message: 'Jogo nao encontrado' });
+app.get('/api/v1/games/:id', async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ message: 'Jogo nao encontrado' });
+  return res.status(200).json(toPublicGame(rows[0]));
+});
+
+app.get('/api/v1/games/:id/offers', async (req, res) => {
+  const gameRes = await pool.query('SELECT id FROM games WHERE id = $1', [req.params.id]);
+  if (!gameRes.rows[0]) return res.status(404).json({ message: 'Jogo nao encontrado' });
+
+  const { rows } = await pool.query(
+    `SELECT id, game_id AS "gameId", platform, edition, activation_platform AS "activationPlatform",
+            region, price, currency, available
+     FROM game_offers WHERE game_id = $1`,
+    [req.params.id]
+  );
+  const formatted = rows.map((r) => ({ ...r, price: r.price !== null ? Number(r.price) : null }));
+  return res.status(200).json(formatted);
+});
+
+app.get('/api/v1/games/:id/reviews', async (req, res) => {
+  const gameRes = await pool.query('SELECT id FROM games WHERE id = $1', [req.params.id]);
+  if (!gameRes.rows[0]) return res.status(404).json({ message: 'Jogo nao encontrado' });
+
+  const { rows } = await pool.query(
+    `SELECT r.id, r.game_id AS "gameId", r.user_id AS "userId",
+            u.username, u.display_name AS "displayName",
+            r.rating, r.comment, r.created_at AS "createdAt", r.updated_at AS "updatedAt"
+     FROM game_reviews r
+     JOIN users u ON u.id = r.user_id
+     WHERE r.game_id = $1
+     ORDER BY r.updated_at DESC`,
+    [req.params.id]
+  );
+  return res.status(200).json(rows);
+});
+
+app.post('/api/v1/games/:id/reviews', requireAuth, async (req, res) => {
+  const gameRes = await pool.query('SELECT id FROM games WHERE id = $1', [req.params.id]);
+  if (!gameRes.rows[0]) return res.status(404).json({ message: 'Jogo nao encontrado' });
+
+  const { rating, comment } = req.body || {};
+  const numericRating = Number(rating);
+  if (!Number.isInteger(numericRating) || numericRating < 1 || numericRating > 5) {
+    return res.status(400).json({ message: 'A classificacao (rating) deve ser um numero inteiro entre 1 e 5' });
   }
-  return res.json(game);
+
+  const reviewId = `rev_${crypto.randomUUID().slice(0, 8)}`;
+  const cleanComment = comment !== undefined ? String(comment).trim() : '';
+
+  const { rows } = await pool.query(
+    `INSERT INTO game_reviews (id, game_id, user_id, rating, comment)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (game_id, user_id)
+     DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, updated_at = NOW()
+     RETURNING id, game_id AS "gameId", user_id AS "userId", rating, comment,
+               created_at AS "createdAt", updated_at AS "updatedAt"`,
+    [reviewId, req.params.id, req.user.id, numericRating, cleanComment]
+  );
+
+  return res.status(201).json({
+    ...rows[0],
+    username: req.user.username,
+    displayName: req.user.display_name,
+  });
 });
 
-app.get('/api/v1/games/:id/offers', (req, res) => {
-  const game = games.find((g) => g.id === req.params.id);
-  if (!game) {
-    return res.status(404).json({ message: 'Jogo nao encontrado' });
-  }
-  const offers = gameOffers.filter((o) => o.gameId === game.id);
-  return res.status(200).json(offers);
-});
-
-app.listen(PORT, () => {
-  console.log(`Servidor a correr na porta ${PORT}`);
-});
+initDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Servidor a correr na porta ${PORT} e ligado ao PostgreSQL`);
+    });
+  })
+  .catch((err) => {
+    console.error('Erro ao inicializar a base de dados PostgreSQL:', err);
+    process.exit(1);
+  });
